@@ -1,0 +1,61 @@
+# PaladinCore — 3-node Raft cluster
+# Usage: docker compose up -d
+
+services:
+  node1:
+    build: .
+    command: >
+      /app/paladin-core cluster
+      --id node1
+      --raft node1:9001
+      --http :8080
+      --data /data
+      --bootstrap
+    ports:
+      - "8080:8080"
+    volumes:
+      - node1-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  node2:
+    build: .
+    command: >
+      /app/paladin-core cluster
+      --id node2
+      --raft node2:9001
+      --http :8080
+      --data /data
+      --join node1:8080
+    ports:
+      - "8081:8080"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+  node3:
+    build: .
+    command: >
+      /app/paladin-core cluster
+      --id node3
+      --raft node3:9001
+      --http :8080
+      --data /data
+      --join node1:8080
+    ports:
+      - "8082:8080"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      node1:
+        condition: service_healthy
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
