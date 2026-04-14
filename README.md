@@ -83,3 +83,4 @@ paladin-core/
 | RPC | 自定义 GoRPC | HTTP 转发 |
 | ACL | 完整访问控制 | JWT token |
 | Message 模块 | 运维公告 | 不实现 |
+# paladin-core
