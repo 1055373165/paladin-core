@@ -82,129 +82,11 @@ _**Built to be read, not just to be run.**_
 
 ### 系统分层（d2）
 
-```d2
-direction: down
-
-client: "客户端 (业务服务)" {
-  shape: person
-}
-
-sdk: "PaladinCore SDK" {
-  shape: rectangle
-  style.fill: "#E3F2FD"
-
-  pull: "① 启动全量拉取"
-  watch: "② 长轮询增量订阅"
-  cache: "③ 本地缓存 (SHA-256)" {
-    shape: cylinder
-  }
-}
-
-cluster: "Raft 集群 (3 节点)" {
-  style.fill: "#FFF3E0"
-
-  leader: "Leader\n(node1)" {
-    shape: hexagon
-    style.fill: "#FFB74D"
-    style.bold: true
-
-    api: "HTTP API\n/api/v1/config"
-    raft_core: "Raft Core\n(hashicorp/raft)"
-    fsm: "FSM.Apply"
-    wcache: "WatchCache\n(ring buffer)" {
-      shape: cylinder
-    }
-    boltdb: "BoltDB\n(data.db)" {
-      shape: cylinder
-    }
-    raftlog: "Raft Log\n(raft-log.db)" {
-      shape: cylinder
-    }
-
-    api -> raft_core: "write"
-    raft_core -> fsm: "commit"
-    fsm -> boltdb: "persist"
-    fsm -> wcache: "append event"
-    raft_core -> raftlog: "append log"
-  }
-
-  follower1: "Follower\n(node2)" {
-    shape: hexagon
-    style.fill: "#90CAF9"
-    forward: "ForwardRPC"
-    fsm2: "FSM.Apply"
-    boltdb2: "BoltDB" {
-      shape: cylinder
-    }
-  }
-
-  follower2: "Follower\n(node3)" {
-    shape: hexagon
-    style.fill: "#90CAF9"
-    forward: "ForwardRPC"
-    fsm3: "FSM.Apply"
-    boltdb3: "BoltDB" {
-      shape: cylinder
-    }
-  }
-
-  leader.raft_core -> follower1.fsm2: "AppendEntries"
-  leader.raft_core -> follower2.fsm3: "AppendEntries"
-  follower1.forward -> leader.api: "write proxy"
-  follower2.forward -> leader.api: "write proxy"
-}
-
-client -> sdk.pull: "Get / OnChange"
-sdk.pull -> cluster.leader.api: "GET /config/..."
-sdk.watch -> cluster.follower1: "GET /watch (long-poll)"
-sdk.cache <-> sdk.pull: "fallback"
-```
+![alt text](./doc/resources/d2%20(1)-1.svg)
 
 ### 模块依赖（d2）
 
-```d2
-direction: right
-
-cmd: "cmd/paladin-core\n(main.go)" {
-  shape: rectangle
-  style.fill: "#C8E6C9"
-}
-
-server_pkg: "server/" {
-  style.fill: "#FFE0B2"
-  server_go: "server.go\nHTTP CRUD"
-  watch_go: "watch.go\n长轮询"
-  raft_server: "raft_server.go\nForwardRPC + /admin"
-}
-
-raft_pkg: "raft/" {
-  style.fill: "#FFCDD2"
-  node: "node.go\nRaft Node + FSM"
-}
-
-store_pkg: "store/" {
-  style.fill: "#B3E5FC"
-  iface: "store.go\nStore interface"
-  bolt: "bolt.go\nBoltDB impl"
-  watch: "watch.go\nWatchCache (ring buf)"
-  watchable: "watchable.go\n存储+事件桥梁"
-}
-
-sdk_pkg: "sdk/" {
-  style.fill: "#F8BBD0"
-  client: "client.go\n三级降级客户端"
-}
-
-cmd -> server_pkg
-cmd -> raft_pkg
-cmd -> store_pkg
-server_pkg.raft_server -> raft_pkg
-raft_pkg -> store_pkg.watchable
-store_pkg.watchable -> store_pkg.bolt
-store_pkg.watchable -> store_pkg.watch
-server_pkg.watch_go -> store_pkg.watch
-sdk_pkg -> server_pkg: "HTTP"
-```
+![alt text](./doc/resources/d2%20(2).svg)
 
 ---
 
@@ -212,99 +94,15 @@ sdk_pkg -> server_pkg: "HTTP"
 
 ### 写入链路：客户端 PUT → Raft 复制 → Watch 推送
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant F as Follower (node2)
-    participant L as Leader (node1)
-    participant Log as Raft Log
-    participant FSM as FSM.Apply
-    participant DB as BoltDB
-    participant WC as WatchCache
-    participant W as Watching SDK
-
-    C->>F: PUT /api/v1/config/public/prod/db_host
-    Note over F: IsLeader()? No → forward
-    F->>L: HTTP proxy (X-Forwarded-By: node2)
-    L->>Log: raft.Apply(op{put, k, v})
-    Log-->>L: quorum ACK (node1+node2)
-    L->>FSM: Apply(log)
-    FSM->>DB: tx.Put(k, v), rev++
-    FSM->>WC: Append(Event{PUT, entry})
-    WC-->>W: cond.Broadcast() 唤醒长轮询
-    L-->>F: 200 {revision: N}
-    F-->>C: 200 {revision: N}
-    W-->>W: 更新本地 map + 回调 OnChange
-```
+![alt text](./doc/resources/mermaid-diagram-2026-04-14-200754.svg)
 
 ### 订阅链路：SDK Watch 长轮询（含断连重连）
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SDK
-    participant Srv as Server
-    participant WC as WatchCache
-    participant FSM as FSM.Apply
-
-    Note over SDK: 启动: fullPull() rev=100
-    loop Watch Loop
-        SDK->>Srv: GET /watch?revision=100&timeout=30
-        Srv->>WC: WaitForEvents(after=100, prefix, 30s)
-        alt 已有新事件 (rev>100)
-            WC-->>Srv: []Event (从环形缓冲区二分查找)
-            Srv-->>SDK: 200 {events, revision: 105}
-            SDK->>SDK: applyEvents() → 回调 OnChange
-            SDK->>SDK: saveToCache() (SHA-256 校验)
-        else 暂无事件
-            WC->>WC: cond.Wait() 阻塞
-            FSM->>WC: Append(newEvent)
-            WC->>WC: cond.Broadcast()
-            WC-->>Srv: [newEvent]
-            Srv-->>SDK: 200 {events, revision: 101}
-        else 30s 超时
-            WC-->>Srv: nil
-            Srv-->>SDK: 200 {events: [], revision: 100}
-            Note over SDK: 立即发起下一轮
-        end
-    end
-
-    Note over SDK,Srv: 网络抖动断连
-    SDK-xSrv: 连接断开
-    SDK->>SDK: sleep(RetryBackoff=1s)
-    SDK->>Srv: GET /watch?revision=100 (续传)
-    Srv-->>SDK: 全量补齐 rev=100..N 的事件
-```
+![alt text](./doc/resources/mermaid-diagram-2026-04-14-200824.svg)
 
 ### 故障恢复：Leader 宕机 + SDK 缓存兜底
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant SDK
-    participant N1 as node1 (old Leader)
-    participant N2 as node2
-    participant N3 as node3
-
-    N1-xN2: 心跳超时 (1-2s)
-    N1-xN3: 心跳超时
-    Note over N2,N3: 选举触发，随机超时后 node2 发起
-    N2->>N3: RequestVote(term+1)
-    N3-->>N2: voteGranted
-    Note over N2: term+1, 成为 new Leader
-
-    SDK->>N1: PUT /config (client 旧连接)
-    N1-xSDK: connection refused
-    SDK->>N2: retry to next addr
-    Note over N2: IsLeader()? Yes → direct apply
-    N2-->>SDK: 200 {revision: N+1}
-
-    Note over SDK: 极端场景：整个集群不可达
-    SDK->>SDK: fullPull() 失败
-    SDK->>SDK: loadFromCache() (验证 SHA-256)
-    SDK->>SDK: 使用上次缓存的配置继续启动 ✓
-```
+![alt text](./doc/resources/mermaid-diagram-2026-04-14-200847.svg)
 
 ---
 
